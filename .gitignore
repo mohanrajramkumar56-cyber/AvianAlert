@@ -10,11 +10,7 @@ __pycache__/
 *.pyd
 .Python
 
-# Trained model files (large binary files)
-*.pkl
-*.joblib
-*.h5
-*.model
+# NOTE: *.pkl model files ARE included (needed for Streamlit Cloud deployment)
 
 # Jupyter
 .ipynb_checkpoints/
