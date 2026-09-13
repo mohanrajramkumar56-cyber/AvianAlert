@@ -1,71 +1,80 @@
 import sys
 import os
 
-# Make sure src/ is importable from this app/ folder
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, BASE_DIR)
 sys.path.insert(0, os.path.join(BASE_DIR, 'src'))
 
 import streamlit as st
+import numpy as np
+import pandas as pd
 import joblib
 from pathlib import Path
 
-MODEL_PATH = Path(BASE_DIR) / 'models' / 'rf_model.pkl'
-DATA_PATH  = Path(BASE_DIR) / 'data' / 'synthetic_data.csv'
+# ── Train model once and cache it (survives reruns, trains only once per session) ──
+@st.cache_resource(show_spinner="Training model on first run... please wait ~60 seconds")
+def load_or_train_model():
+    model_path = Path(BASE_DIR) / 'models' / 'rf_model.pkl'
+    data_path  = Path(BASE_DIR) / 'data'   / 'synthetic_data.csv'
 
-# ── Auto-train model if it doesn't exist (needed on Streamlit Cloud) ──
-def ensure_model():
-    if not MODEL_PATH.exists():
-        st.info("First run: training model... this takes ~60 seconds. Please wait.")
-        progress = st.progress(0, text="Generating training data...")
+    # If model file already exists on disk, load it
+    if model_path.exists():
+        return joblib.load(model_path)
 
-        from data_generator import generate
+    # Otherwise train from scratch
+    from data_generator import generate
+    from preprocess import load_and_preprocess
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
+    from xgboost import XGBClassifier
+
+    # Generate data if missing
+    if not data_path.exists():
         generate(10000)
-        progress.progress(30, text="Training ensemble model (RF + XGBoost + GBM)...")
 
-        # Inline training to avoid import issues on cloud
-        from preprocess import load_and_preprocess
-        from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
-        from sklearn.metrics import roc_auc_score
-        from xgboost import XGBClassifier
+    X_train, X_test, y_train, y_test = load_and_preprocess(path=data_path)
 
-        X_train, X_test, y_train, y_test = load_and_preprocess(path=DATA_PATH)
+    rf = RandomForestClassifier(
+        n_estimators=200, max_depth=12,
+        class_weight='balanced', random_state=42, n_jobs=-1
+    )
+    scale_pos = float((y_train == 0).sum()) / float(max((y_train == 1).sum(), 1))
+    xgb = XGBClassifier(
+        n_estimators=200, max_depth=6, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8,
+        scale_pos_weight=scale_pos, eval_metric='auc',
+        random_state=42, n_jobs=-1, verbosity=0
+    )
+    gb = GradientBoostingClassifier(
+        n_estimators=200, max_depth=5,
+        learning_rate=0.05, subsample=0.8, random_state=42
+    )
+    ensemble = VotingClassifier(
+        estimators=[('rf', rf), ('xgb', xgb), ('gb', gb)],
+        voting='soft', n_jobs=-1
+    )
+    ensemble.fit(X_train, y_train)
 
-        rf = RandomForestClassifier(n_estimators=200, max_depth=12,
-                                    class_weight='balanced', random_state=42, n_jobs=-1)
-        scale_pos = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
-        xgb = XGBClassifier(n_estimators=200, max_depth=6, learning_rate=0.05,
-                             subsample=0.8, colsample_bytree=0.8,
-                             scale_pos_weight=scale_pos, eval_metric='auc',
-                             random_state=42, n_jobs=-1, verbosity=0)
-        gb = GradientBoostingClassifier(n_estimators=200, max_depth=5,
-                                        learning_rate=0.05, subsample=0.8, random_state=42)
+    # Save for future runs
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(ensemble, model_path)
 
-        progress.progress(60, text="Fitting ensemble...")
-        ensemble = VotingClassifier(
-            estimators=[('rf', rf), ('xgb', xgb), ('gb', gb)],
-            voting='soft', n_jobs=-1
-        )
-        ensemble.fit(X_train, y_train)
-        MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(ensemble, MODEL_PATH)
+    return ensemble
 
-        auc = roc_auc_score(y_test, ensemble.predict_proba(X_test)[:, 1])
-        progress.progress(100, text=f"Model ready! ROC-AUC: {auc:.4f}")
-        st.success(f"Model trained successfully! ROC-AUC: {auc:.4f}")
-        st.rerun()
+MODEL = load_or_train_model()
 
-ensure_model()
-
-# ── Load model ──
-from src.predict import predict_from_dict
+def predict(d):
+    df = pd.DataFrame([d])
+    df = pd.get_dummies(df)
+    df = df.reindex(columns=MODEL.feature_names_in_, fill_value=0)
+    prob = MODEL.predict_proba(df)[:, 1][0]
+    return float(prob)
 
 # ── UI ──
-st.set_page_config(page_title='AvianAlert — Bird Flu Screener', layout='centered')
+st.set_page_config(page_title='AvianAlert — Bird Flu Screener', page_icon='🦠', layout='centered')
 
 st.title('🦠 AvianAlert')
 st.subheader('AI-Powered Bird Flu (H5N1) Screening')
-st.caption('Prototype with synthetic data. Not for medical use.')
+st.caption('Prototype with synthetic data only. Not for real medical use.')
 st.divider()
 
 with st.form('patient_form'):
@@ -77,7 +86,7 @@ with st.form('patient_form'):
     with col2:
         occupation = st.selectbox('Occupation', ['Farmer', 'Healthcare', 'Student', 'Office', 'Other'])
         wbc        = st.number_input('WBC Count (cells/uL)', 2000, 20000, value=7000, step=100,
-                                     help='Normal: 4500-11000. Low WBC is a bird flu sign.')
+                                     help='Normal: 4500-11000. Low WBC is a key bird flu sign.')
 
     st.subheader('🌍 Exposure History')
     col3, col4 = st.columns(2)
@@ -130,7 +139,7 @@ if submitted:
         'chest_xray':     1 if chest_xray else 0,
     }
 
-    prob = predict_from_dict(d)
+    prob = predict(d)
 
     st.divider()
     st.subheader('📊 Prediction Result')
@@ -139,7 +148,7 @@ if submitted:
     with col_r1:
         st.metric('Bird Flu Risk', f'{prob * 100:.1f}%')
     with col_r2:
-        st.progress(int(prob * 100), text=f'Confidence: {prob*100:.1f}%')
+        st.progress(int(prob * 100), text=f'Model confidence: {prob*100:.1f}%')
 
     if prob >= 0.6:
         st.error('🚨 HIGH RISK — Seek clinical testing and isolate immediately.')
@@ -148,13 +157,13 @@ if submitted:
         - Isolate the patient immediately
         - Order RT-PCR test for H5N1
         - Notify public health authorities
-        - Start antiviral (Oseltamivir) consideration
+        - Consider antiviral (Oseltamivir)
         """)
     elif prob >= 0.4:
         st.warning('⚠️ MEDIUM RISK — Consider testing and consult a doctor.')
         st.markdown("""
         **Recommended actions:**
-        - Monitor closely for 24-48 hours
+        - Monitor closely for 24–48 hours
         - Consider RT-PCR if symptoms worsen
         - Review exposure history carefully
         """)
